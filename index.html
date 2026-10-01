@@ -121,6 +121,19 @@ td.r,th.r{text-align:right}
 .sess li b{font-weight:500;min-width:170px}
 .sess .note{font-size:14px;color:var(--muted);font-style:italic}
 .acts{display:flex;gap:8px;flex-wrap:wrap}
+.syncbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding-top:12px;font-size:13px}
+.syncbar .acts{margin-left:auto}
+.sync-state{display:inline-flex;align-items:center;gap:6px;font-weight:500}
+.sync-state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--plate10)}
+.sync-state.busy::before{background:var(--plate20)}
+.sync-state.warn::before{background:var(--plate15)}
+.sync-state.err{color:var(--plate25)} .sync-state.err::before{background:var(--plate25)}
+body.locked header, body.locked .wrap{display:none}
+.login{min-height:100vh;display:grid;place-items:center;padding-inline:16px;padding-block:32px}
+.login-card{width:100%;max-width:380px;display:flex;flex-direction:column;gap:14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:24px}
+.login-card h1{margin:0}
+.login-card input{width:100%}
+.hint.bad{color:var(--plate25)}
 .io{display:flex;flex-direction:column;gap:10px;padding-bottom:16px;margin-bottom:16px;border-bottom:1px solid var(--line)}
 .io-t{display:flex;flex-direction:column;gap:2px}
 .filebtn{display:inline-flex;align-items:center;cursor:pointer}
@@ -134,6 +147,16 @@ td.r,th.r{text-align:right}
 
 </head>
 <body>
+<section id="login" class="login" hidden>
+  <form id="loginForm" class="login-card" novalidate>
+    <h1>Kellergym<span>.</span>Logbuch</h1>
+    <p class="hint">Melde dich an, damit deine Trainings auf allen Geräten gleich sind.</p>
+    <div class="field"><label class="label" for="lEmail">E-Mail</label><input id="lEmail" type="email" autocomplete="username" required></div>
+    <div class="field"><label class="label" for="lPass">Passwort</label><input id="lPass" type="password" autocomplete="current-password" required minlength="6"></div>
+    <div class="acts"><button class="btn" type="submit" id="lIn">Anmelden</button><button class="btn ghost" type="button" id="lUp">Konto erstellen</button></div>
+    <div id="loginMsg" class="hint" role="alert"></div>
+  </form>
+</section>
 <header>
   <div class="hbar">
     <h1>Kellergym<span>.</span>Logbuch</h1>
@@ -146,6 +169,12 @@ td.r,th.r{text-align:right}
 </header>
 
 <div class="wrap">
+  <div id="syncBar" class="syncbar" hidden>
+    <span id="syncState" class="sync-state">Verbunden</span>
+    <span class="hint" id="syncWho"></span>
+    <span class="acts"><button class="btn small ghost" type="button" id="syncNow">Jetzt synchronisieren</button><button class="btn small ghost" type="button" id="logout">Abmelden</button></span>
+  </div>
+  <div id="logoutBox" class="notice" hidden></div>
   <div id="storeNote" class="notice" hidden></div>
   <div id="demoNote" class="notice" hidden>
     <span><b>Beispieldaten.</b> So sieht dein Dashboard nach ein paar Wochen aus. Sobald du dein erstes Training einträgst, verschwinden sie.</span>
@@ -248,6 +277,8 @@ td.r,th.r{text-align:right}
 </div>
 <div class="toast" id="toast" hidden></div>
 
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"></script>
 <script>
 (() => {
 // ---------- Übungskatalog (nach Geräten im Keller) ----------
@@ -277,47 +308,180 @@ function toast(msg){ const t=$("toast"); t.textContent=msg; t.hidden=false; clea
 
 // ---------- Speicher ----------
 let sessions = [];     // echte Daten
-let mode = "loading";  // "db" | "local" | "loading"
-let col = null;
-const LS_KEY = "kellergym-sessions";
+let mode = "loading";  // "cloud" | "local" | "loading"
+const LS_KEY = "kellergym-sessions", Q_KEY = "kellergym-queue", OWNER_KEY = "kellergym-owner";
+const CFG = window.KELLERGYM_CONFIG || {};
+let queue = [];        // ausstehende Änderungen: {op:"up", s} | {op:"del", id}
+let sb = null, me = null, syncing = false, syncAgain = false, pulledOnce = false, lastSync = null, syncErr = "";
 
-function loadLocal(){ try{ sessions = JSON.parse(localStorage.getItem(LS_KEY)||"[]"); }catch{ sessions=[]; } }
-function saveLocal(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(sessions)); }catch{} }
+function loadLocal(){
+  try{ sessions = JSON.parse(localStorage.getItem(LS_KEY)||"[]"); }catch{ sessions=[]; }
+  try{ queue = JSON.parse(localStorage.getItem(Q_KEY)||"[]"); }catch{ queue=[]; }
+}
+function saveLocal(){
+  try{ localStorage.setItem(LS_KEY, JSON.stringify(sessions)); localStorage.setItem(Q_KEY, JSON.stringify(queue)); }catch{}
+}
+function showStoreNote(t){ const n=$("storeNote"); n.textContent=t; n.hidden=!t; }
+
+// Pro Training nur die letzte Änderung in der Warteschlange behalten
+function enqueue(op){
+  const id = op.op==="up" ? op.s.id : op.id;
+  queue = queue.filter(q => (q.op==="up" ? q.s.id : q.id) !== id);
+  queue.push(op);
+}
 
 async function initStore(){
-  let db=null, user=null, uid=null;
+  loadLocal();
+  try{ navigator.storage?.persist?.(); }catch{}
+  const configured = CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase?.createClient;
+  if(!configured){
+    mode="local";
+    showStoreNote("Kein Sync eingerichtet: Deine Trainings liegen nur in diesem Browser. Trag Supabase-URL und Key in config.js ein (siehe README).");
+    render(); return;
+  }
+  sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, {auth:{persistSession:true, autoRefreshToken:true, detectSessionInUrl:true}});
+  let session=null;
+  try{ ({data:{session}} = await sb.auth.getSession()); }catch{}
+  if(session) enterCloud(session.user); else showLogin();
+}
+
+function enterCloud(user){
+  me=user; mode="cloud";
+  let owner=null; try{ owner=localStorage.getItem(OWNER_KEY); }catch{}
+  if(owner && owner!==user.id){ sessions=[]; queue=[]; }          // anderes Konto auf diesem Gerät
+  else if(!owner && sessions.length){                              // erste Anmeldung: lokale Daten hochladen
+    sessions.forEach(s=>enqueue({op:"up", s}));
+    toast(`${sessions.length} lokale Trainings werden hochgeladen`);
+  }
+  try{ localStorage.setItem(OWNER_KEY, user.id); }catch{}
+  saveLocal();
+  document.body.classList.remove("locked"); $("login").hidden=true;
+  $("syncBar").hidden=false; $("syncWho").textContent=user.email||"";
+  showStoreNote("");
+  render(); sync();
+}
+
+const rowOf = s => ({user_id: me.id, id: s.id, date: s.date, data: s, updated_at: new Date().toISOString()});
+
+async function sync(){
+  if(mode!=="cloud") return;
+  if(syncing){ syncAgain=true; return; }
+  syncing=true; syncErr=""; setSync();
   try{
-    if (window.claude && typeof window.claude.use==="function"){
-      [db,user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
-      if (user) uid = await user.id();
+    // 1. Ausstehende Änderungen hochladen (aufeinanderfolgende Uploads gebündelt)
+    while(queue.length){
+      const first=queue[0]; let n=1;
+      if(first.op==="up"){
+        while(n<queue.length && n<500 && queue[n].op==="up") n++;
+        const {error} = await sb.from("sessions").upsert(queue.slice(0,n).map(q=>rowOf(q.s)), {onConflict:"user_id,id"});
+        if(error) throw error;
+      } else {
+        const {error} = await sb.from("sessions").delete().eq("user_id", me.id).eq("id", first.id);
+        if(error) throw error;
+      }
+      const done=queue.slice(0,n); queue=queue.filter(q=>!done.includes(q)); saveLocal(); setSync();
     }
-  }catch{ db=null; }
-  if (db && uid){
-    mode="db";
-    col = db.collection("data/users/"+uid);
-    col.onSnapshot(snap => {
-      sessions = snap.docs.map(d => ({...d.data(), id:d.id}));
-      render();
-    }, err => {
-      showStoreNote("Verbindung zum Speicher unterbrochen. Lade die Seite neu, um weiter zu speichern.");
-    });
-  } else {
-    mode="local"; loadLocal();
-    showStoreNote("Deine Trainings liegen nur in diesem Browser auf diesem Gerät. Exportiere ab und zu als JSON (Reiter Verlauf), damit nichts verloren geht.");
-    try{ navigator.storage?.persist?.(); }catch{}
-    render();
+    // 2. Alles vom Server holen (Server ist die Wahrheit, plus noch nicht hochgeladene lokale Änderungen)
+    const rows=[]; const PAGE=1000;
+    for(let from=0;;from+=PAGE){
+      const {data, error} = await sb.from("sessions").select("id,data").order("id").range(from, from+PAGE-1);
+      if(error) throw error;
+      rows.push(...data); if(data.length<PAGE) break;
+    }
+    const byId=new Map(rows.map(r=>[r.id, {...r.data, id:r.id}]));
+    queue.forEach(q=>{ if(q.op==="up") byId.set(q.s.id, q.s); else byId.delete(q.id); });
+    sessions=[...byId.values()]; pulledOnce=true; lastSync=new Date();
+    saveLocal(); render();
+  }catch(e){
+    const m=e?.message||""; syncErr = (!navigator.onLine || /fetch|network/i.test(m)) ? "offline" : (m || "Unbekannter Fehler");
+    if(/JWT|session|token/i.test(syncErr)){ try{ const {data:{session}}=await sb.auth.getSession(); if(!session){ showLogin("Deine Anmeldung ist abgelaufen. Bitte neu anmelden."); } }catch{} }
+  }finally{
+    syncing=false; setSync();
+    if(syncAgain){ syncAgain=false; sync(); }
   }
 }
-function showStoreNote(t){ const n=$("storeNote"); n.textContent=t; n.hidden=false; }
+
+function setSync(){
+  const el=$("syncState"); if(!el) return;
+  const pend=queue.length;
+  let cls="ok", txt;
+  if(syncing) { cls="busy"; txt="Synchronisiere …"; }
+  else if(syncErr==="offline") { cls="warn"; txt = pend ? `Offline · ${pend} ${pend===1?"Änderung wartet":"Änderungen warten"}` : "Offline"; }
+  else if(syncErr) { cls="err"; txt=`Sync-Fehler: ${syncErr}`; }
+  else if(pend) { cls="warn"; txt=`${pend} ${pend===1?"Änderung wartet":"Änderungen warten"}`; }
+  else txt = lastSync ? `Synchronisiert ${lastSync.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"})}` : "Verbunden";
+  el.className="sync-state "+cls; el.textContent=txt;
+}
 
 async function persist(s){
-  if (mode==="db"){ await col.doc(s.id).set(s); }
-  else { const i=sessions.findIndex(x=>x.id===s.id); if(i>=0) sessions[i]=s; else sessions.push(s); saveLocal(); render(); }
+  const i=sessions.findIndex(x=>x.id===s.id); if(i>=0) sessions[i]=s; else sessions.push(s);
+  if(mode==="cloud") enqueue({op:"up", s});
+  saveLocal(); render(); if(mode==="cloud") sync();
 }
 async function remove(id){
-  if (mode==="db"){ await col.doc(id).delete(); }
-  else { sessions=sessions.filter(s=>s.id!==id); saveLocal(); render(); }
+  sessions=sessions.filter(s=>s.id!==id);
+  if(mode==="cloud") enqueue({op:"del", id});
+  saveLocal(); render(); if(mode==="cloud") sync();
 }
+async function bulkPersist(list){
+  const byId=new Map(sessions.map(s=>[s.id,s])); list.forEach(s=>byId.set(s.id,s));
+  sessions=[...byId.values()];
+  if(mode==="cloud") list.forEach(s=>enqueue({op:"up", s}));
+  saveLocal(); render(); if(mode==="cloud") sync();
+}
+
+// Wieder synchronisieren, wenn Netz zurück ist oder die App in den Vordergrund kommt
+window.addEventListener("online", ()=>sync());
+document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible") sync(); });
+setInterval(()=>{ if(document.visibilityState==="visible" && !syncing) sync(); }, 60000);
+
+// ---------- Login ----------
+function showLogin(msg){
+  mode="loading"; document.body.classList.add("locked"); $("login").hidden=false; $("syncBar").hidden=true;
+  $("loginMsg").textContent=msg||""; $("loginMsg").className="hint";
+}
+function loginErr(e){
+  const m=e?.message||"";
+  if(/Invalid login credentials/i.test(m)) return "E-Mail oder Passwort falsch.";
+  if(/Email not confirmed/i.test(m)) return "Bestätige zuerst deine E-Mail-Adresse über den Link in der Mail.";
+  if(/Password should be/i.test(m)) return "Das Passwort ist zu kurz (mindestens 6 Zeichen).";
+  if(/Signups not allowed|signup.*disabled/i.test(m)) return "Neue Konten sind deaktiviert. Melde dich mit deinem bestehenden Konto an.";
+  if(/already registered/i.test(m)) return "Für diese E-Mail gibt es schon ein Konto. Melde dich an.";
+  if(!navigator.onLine || /fetch/i.test(m)) return "Keine Verbindung. Für die erste Anmeldung brauchst du Internet.";
+  return m || "Anmeldung fehlgeschlagen.";
+}
+async function doAuth(kind){
+  const email=$("lEmail").value.trim(), password=$("lPass").value, msg=$("loginMsg");
+  if(!email||!password){ msg.textContent="Bitte E-Mail und Passwort eingeben."; msg.className="hint bad"; return; }
+  $("lIn").disabled=$("lUp").disabled=true; msg.className="hint"; msg.textContent= kind==="in" ? "Melde an …" : "Lege Konto an …";
+  try{
+    const r = kind==="in" ? await sb.auth.signInWithPassword({email,password}) : await sb.auth.signUp({email,password});
+    if(r.error) throw r.error;
+    if(kind==="up" && !r.data.session){ msg.textContent="Konto angelegt. Klick den Link in der Bestätigungs-Mail und melde dich dann hier an."; return; }
+    $("lPass").value=""; enterCloud(r.data.user);
+  }catch(e){ msg.textContent=loginErr(e); msg.className="hint bad"; }
+  finally{ $("lIn").disabled=$("lUp").disabled=false; }
+}
+$("loginForm").addEventListener("submit", e=>{ e.preventDefault(); doAuth("in"); });
+$("lUp").addEventListener("click", ()=>doAuth("up"));
+
+$("syncNow").addEventListener("click", ()=>sync());
+$("logout").addEventListener("click", ()=>{
+  const box=$("logoutBox");
+  box.innerHTML = queue.length
+    ? `<span><b>${queue.length} Änderungen sind noch nicht hochgeladen</b> und gehen beim Abmelden verloren.</span><span class="acts"><button class="btn small danger" type="button" id="logoutYes">Trotzdem abmelden</button><button class="btn small ghost" type="button" id="logoutNo">Abbrechen</button></span>`
+    : `<span>Abmelden entfernt die Trainings von diesem Gerät. In der Cloud bleiben sie erhalten.</span><span class="acts"><button class="btn small" type="button" id="logoutYes">Abmelden</button><button class="btn small ghost" type="button" id="logoutNo">Abbrechen</button></span>`;
+  box.hidden=false;
+});
+$("logoutBox").addEventListener("click", async e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  $("logoutBox").hidden=true;
+  if(b.id!=="logoutYes") return;
+  try{ await sb.auth.signOut(); }catch{}
+  sessions=[]; queue=[]; pulledOnce=false; lastSync=null;
+  try{ [LS_KEY,Q_KEY,OWNER_KEY].forEach(k=>localStorage.removeItem(k)); }catch{}
+  showLogin("Abgemeldet.");
+});
 
 // ---------- Beispieldaten (nur Anzeige, nie gespeichert) ----------
 function demoData(){
@@ -345,7 +509,7 @@ function demoData(){
 }
 let DEMO=null;
 const data = () => sessions.length ? sessions : (DEMO ||= demoData());
-const isDemo = () => mode!=="loading" && sessions.length===0;
+const isDemo = () => mode!=="loading" && sessions.length===0 && (mode!=="cloud" || pulledOnce);
 
 // ---------- Auswertung ----------
 function sessVolume(s){ let v=0; (s.ex||[]).forEach(e=>{ if(!isCardio(e)) (e.sets||[]).forEach(t=>v+=(+t.reps||0)*(+t.kg||0)); }); return v; }
@@ -699,12 +863,7 @@ $("impBox").addEventListener("click", async e=>{
   const list=pendingImport; pendingImport=null;
   b.disabled=true; b.textContent="Importiere …";
   let ok=0, fail=0;
-  if(mode==="db"){
-    for(const s of list){ try{ await col.doc(s.id).set(s); ok++; }catch(x){ fail++; if(x?.code==="quota_exceeded") break; } }
-  } else {
-    const byId=new Map(sessions.map(s=>[s.id,s])); list.forEach(s=>byId.set(s.id,s));
-    sessions=[...byId.values()]; saveLocal(); render(); ok=list.length;
-  }
+  try{ await bulkPersist(list); ok=list.length; }catch{ fail=list.length; }
   impBox(fail ? `<b>${ok} importiert, ${fail} fehlgeschlagen.</b> Versuch den Import mit derselben Datei nochmal. Bereits importierte Trainings werden dabei nur überschrieben, nicht verdoppelt.` : "", !!fail);
   if(!fail) toast(`${ok} Trainings importiert`);
 });

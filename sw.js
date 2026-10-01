@@ -1,6 +1,8 @@
-// Offline-Cache: App-Dateien cache-first, Schriften nachladen und merken.
-const CACHE = "kellergym-v1";
-const CORE = ["./", "./index.html", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png"];
+// Offline-Cache. Supabase-Anfragen gehen immer direkt ans Netz.
+const CACHE = "kellergym-v2";
+const CORE = ["./", "./index.html", "./config.js", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png",
+  "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"];
+const CACHEABLE = ["fonts.googleapis.com", "fonts.gstatic.com", "cdn.jsdelivr.net"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
@@ -10,7 +12,9 @@ self.addEventListener("activate", e => {
 });
 self.addEventListener("fetch", e => {
   if (e.request.method !== "GET") return;
-  // Netz zuerst (damit Updates ankommen), bei Offline aus dem Cache
+  const url = new URL(e.request.url);
+  if (url.origin !== location.origin && !CACHEABLE.includes(url.hostname)) return; // z. B. Supabase: nie cachen
+  // Netz zuerst (damit Updates ankommen), offline aus dem Cache
   e.respondWith(
     fetch(e.request).then(res => {
       const copy = res.clone();
